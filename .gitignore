@@ -1,2 +1,3 @@
 .venv/
-attack_data/
+MITRE_ATT&CK_data/
+Splunk_data/
