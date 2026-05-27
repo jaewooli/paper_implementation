@@ -1,27 +1,31 @@
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple
+import os
+import re
+import json
+import logging
 import networkx as nx
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Any, Iterator
+from abc import ABC, abstractmethod
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 # ==========================================
-# 0. Data Structures (데이터 모델 정의)
+# 0. Data Structures
 # ==========================================
-
 @dataclass
-class RawAlert:
-    source_user: str
-    source_host: str
-    destination_host: str
-    event_type: str
-    result: str
-    timestamp: str
+class SplunkLog:
+    raw_data: Dict[str, Any]
+    source_file: str = "unknown"
 
 @dataclass
 class EnrichedIncident:
     incident_id: str
     user: str
+    user_tier: int
     source_host: str
     target_host: str
-    historical_baseline: str
+    target_criticality: int
     event_type: str
     flags: List[str]
 
@@ -37,7 +41,7 @@ class Hypothesis:
 @dataclass
 class ActionOption:
     action_id: str
-    action_primitive: str # e.g., REVOKE_SESSION, ISOLATE_HOST, etc.
+    action_primitive: str
     target: str
     containment_score: float
     business_impact: float
@@ -46,153 +50,272 @@ class ActionOption:
 class RankedAction:
     action: ActionOption
     composite_score: float
-    rank: int
+    rank: int = 0
 
 # ==========================================
-# 1. Perception Layer (인지 계층)
+# [NEW] 1. Smart Field Extractor
 # ==========================================
+def parse_log_fields(raw_data: Dict[str, Any], file_name: str) -> Dict[str, str]:
+    """Splunk, Sysmon, WinEvent 등 다양한 포맷과 깊이에서 src, dest, user를 기필코 찾아내는 헬퍼"""
+    raw_str = raw_data.get("_raw", str(raw_data))
+    
+    # 1. Source 추출 (src, Computer, host, SourceIp 등)
+    src = raw_data.get("src") or raw_data.get("SourceIp") or raw_data.get("Computer") or raw_data.get("host")
+    if not src and isinstance(raw_data.get("result"), dict):
+        src = raw_data["result"].get("src") or raw_data["result"].get("host")
 
-class PerceptionLayer:
-    def __init__(self, knowledge_store: 'InternalKnowledgeStore'):
-        self.knowledge_store = knowledge_store
-        
-    def alert_normalization(self, raw_alert: RawAlert) -> Dict:
-        """이종 알람 데이터를 통합 스키마로 정규화"""
-        pass
-        
-    def situational_contextualization(self, normalized_alert: Dict) -> EnrichedIncident:
-        """지식 저장소의 메타데이터(자산, 권한 등)를 추가하여 컨텍스트 강화"""
-        pass
-        
-    def noise_reduction(self, incident: EnrichedIncident) -> Optional[EnrichedIncident]:
-        """중복 및 저신뢰도 시그널 제거"""
-        pass
-        
-    def process(self, raw_alert: RawAlert) -> EnrichedIncident:
-        """Sense 파이프라인 통합 실행"""
-        pass
+    # 2. Destination 추출 (dest, TargetDomainName, DestinationIp 등)
+    dest = raw_data.get("dest") or raw_data.get("DestinationIp") or raw_data.get("TargetDomainName")
+    if not dest and isinstance(raw_data.get("result"), dict):
+        dest = raw_data["result"].get("dest")
 
-# ==========================================
-# 2. Agentic Reasoning Layer (에이전트 추론 계층)
-# ==========================================
+    # 3. 최후의 수단: Plain Text에서 정규식으로 IP 추출
+    ips = re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', raw_str)
+    if not src and ips: src = ips[0]
+    if not dest and len(ips) > 1: dest = ips[1]
 
-class NarrativeCounterfactualEngine:
-    def __init__(self, llm_client):
-        self.llm = llm_client # Mock LLM for POC
-        
-    def generate_hypotheses(self, incident: EnrichedIncident) -> List[Hypothesis]:
-        """LLM을 활용한 다중 공격 진전 가설 생성 (MITRE ATT&CK 기반)"""
-        pass
+    # 4. User 및 Event Type 추출
+    user = raw_data.get("user") or raw_data.get("UserName") or raw_data.get("TargetUserName")
+    event_type = raw_data.get("sourcetype") or raw_data.get("EventID") or file_name.split(".")[0]
 
-class StructuralSimulationEngine:
-    def __init__(self, topology_graph: nx.DiGraph, privilege_graph: nx.DiGraph):
-        self.topology_graph = topology_graph
-        self.privilege_graph = privilege_graph
-        
-    def validate_feasibility(self, hypotheses: List[Hypothesis], incident: EnrichedIncident) -> List[Hypothesis]:
-        """엔터프라이즈 토폴로지 및 권한 구조 기반 가설 검증"""
-        pass
-
-class RiskScoringEvaluationModule:
-    def __init__(self, alpha: float = 0.7, beta: float = 0.3):
-        self.alpha = alpha # Containment weight
-        self.beta = beta   # Business Impact weight
-        
-    def rank_actions(self, feasible_hypotheses: List[Hypothesis], incident: EnrichedIncident) -> List[RankedAction]:
-        """
-        수식: Composite Score = (alpha * Containment) - (beta * Business Impact)
-        비즈니스 영향도와 차단 효과를 계산하여 대응 행동 랭킹 산출
-        """
-        pass
-
-class AgenticReasoningLayer:
-    def __init__(self, nce: NarrativeCounterfactualEngine, sse: StructuralSimulationEngine, rsem: RiskScoringEvaluationModule):
-        self.nce = nce
-        self.sse = sse
-        self.rsem = rsem
-        
-    def process(self, incident: EnrichedIncident) -> List[RankedAction]:
-        """Reason 파이프라인 통합 실행"""
-        pass
+    return {
+        "src": str(src).strip() if src else "unknown_src",
+        "dest": str(dest).strip() if dest else "unknown_dest",
+        "user": str(user).strip() if user else "unknown_user",
+        "event_type": str(event_type).strip(),
+        "timestamp": raw_data.get("_time", "unknown_time")
+    }
 
 # ==========================================
-# 3. Action and Playbook Layer (대응 및 플레이북 계층)
+# 2. Data Ingestion
 # ==========================================
+class SplunkDataIngester:
+    def __init__(self, base_directory: str):
+        self.base_dir = Path(base_directory)
+        
+    def stream_logs(self, limit: Optional[int] = None) -> Iterator[SplunkLog]:
+        if not self.base_dir.exists(): return
+        
+        files = list(self.base_dir.rglob("*.json")) + list(self.base_dir.rglob("*.log"))
+        count = 0
+        
+        for file_path in files:
+            if limit and count >= limit: break
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                try:
+                    content = f.read()
+                    f.seek(0)
+                    data = json.loads(content)
+                    if isinstance(data, list):
+                        for item in data:
+                            if limit and count >= limit: break
+                            yield SplunkLog(raw_data=item, source_file=file_path.name)
+                            count += 1
+                        continue
+                    elif isinstance(data, dict):
+                        yield SplunkLog(raw_data=data, source_file=file_path.name)
+                        count += 1
+                        continue
+                except json.JSONDecodeError:
+                    pass
 
-class ActionAndPlaybookLayer:
-    def __init__(self, execution_interface: 'ExecutionInterface'):
-        self.execution_interface = execution_interface
-        self.action_primitives = [
-            "REVOKE_SESSION", "RESTRICT_PRIVILEGES", 
-            "ENABLE_MFA", "QUARANTINE_ACCESS", "MONITOR_ONLY"
-        ]
-        
-    def adaptive_playbook_generator(self, ranked_actions: List[RankedAction]) -> Dict:
-        """가장 높은 랭킹의 행동들을 조합하여 워크플로우(플레이북) 동적 생성"""
-        pass
-        
-    def policy_and_safety_guardrails(self, playbook: Dict) -> bool:
-        """비즈니스 임계치 및 운영 의존성을 바탕으로 안전성 검증"""
-        pass
-        
-    def execute(self, playbook: Dict, dry_run: bool = True) -> bool:
-        """SOAR/EDR 인프라를 통한 대응 실행 (기본값: Dry-run)"""
-        pass
-
-class ExecutionInterface:
-    """Mock 클래스: 외부 EDR, SOAR, IAM 인프라와의 연동 인터페이스"""
-    def enforce_action(self, action: str, target: str) -> bool:
-        pass
+                f.seek(0)
+                for line in f:
+                    line = line.strip()
+                    if not line: continue
+                    if limit and count >= limit: break
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        item = {"_raw": line} # 순수 텍스트 로그
+                    yield SplunkLog(raw_data=item, source_file=file_path.name)
+                    count += 1
 
 # ==========================================
-# 4. Supporting Components (지원 컴포넌트)
+# 3. Dynamic Topology Builder (Pass 1)
 # ==========================================
+class LogBasedTopologyBuilder:
+    def __init__(self):
+        self.graph = nx.DiGraph()
+
+    def ingest_single_log(self, log: SplunkLog):
+        fields = parse_log_fields(log.raw_data, log.source_file)
+        src, dest = fields["src"], fields["dest"]
+        
+        # Source나 Dest 하나라도 존재하면 노드(자산)로 등록 (단일 호스트 이벤트 허용)
+        if src != "unknown_src": self.graph.add_node(src)
+        if dest != "unknown_dest": self.graph.add_node(dest)
+        
+        # 둘 다 존재하면 네트워크 간선(Edge) 추가
+        if src != "unknown_src" and dest != "unknown_dest" and src != dest:
+            if self.graph.has_edge(src, dest):
+                self.graph[src][dest]['weight'] += 1
+            else:
+                self.graph.add_edge(src, dest, weight=1)
+
+    def analyze_and_classify_nodes(self) -> nx.DiGraph:
+        for node in self.graph.nodes():
+            in_d, out_d = self.graph.in_degree(node), self.graph.out_degree(node)
+            tier, crit, role = 2, 3, "Workstation"
+            if in_d > 3 and out_d <= 2: role, tier, crit = "Server", 1, 7
+            elif in_d > 5 and out_d > 5: role, tier, crit = "Core_Infra", 0, 10
+            
+            self.graph.nodes[node].update({'role': role, 'tier': tier, 'criticality': crit})
+        return self.graph
+
+# ==========================================
+# 4. Core Engine (Layers & Modules)
+# ==========================================
+class SimulatedLLM:
+    def generate_json(self, prompt: str) -> str:
+        return json.dumps([{
+            "hypothesis_id": "H-AUTO",
+            "description": "Potential unauthorized access or local execution",
+            "confidence": 0.65,
+            "mitre_attack_techniques": ["T1059", "T1078"]
+        }])
 
 class InternalKnowledgeStore:
-    def __init__(self):
-        self.cmdb = {} # 자산 및 서비스 메타데이터
-        self.iam_graph = nx.DiGraph() # 권한 및 신원 그래프
-        self.network_topology = nx.DiGraph() # 네트워크 도달성
-        
+    def __init__(self): self.topology = nx.DiGraph()
+    def load_topology(self, graph: nx.DiGraph): self.topology = graph
     def query_context(self, user: str, host: str) -> Dict:
-        """인지 계층을 위한 컨텍스트 질의"""
-        pass
-        
-    def update_state(self, updates: Dict):
-        """환경 변화에 따른 지식 베이스 최신화"""
-        pass
+        node_data = self.topology.nodes.get(host, {})
+        return {
+            "user_tier": 0 if "admin" in str(user).lower() else node_data.get('tier', 2),
+            "target_criticality": node_data.get('criticality', 3)
+        }
 
-class RealTimeMonitoring:
+class PerceptionLayer:
     def __init__(self, knowledge_store: InternalKnowledgeStore):
         self.knowledge_store = knowledge_store
         
-    def observe_outcomes(self, executed_playbook: Dict):
-        """조치 실행 후 환경 상태 변화 캡처 및 지식 저장소 피드백"""
-        pass
-
-# ==========================================
-# Main: AgentSOC Controller
-# ==========================================
-
-class AgentSOC:
-    def __init__(self):
-        # 1. Initialize Supporting Components
-        self.knowledge_store = InternalKnowledgeStore()
-        self.monitoring = RealTimeMonitoring(self.knowledge_store)
+    def process_alert(self, log: SplunkLog) -> EnrichedIncident:
+        fields = parse_log_fields(log.raw_data, log.source_file)
         
-        # 2. Initialize Layers
-        self.perception = PerceptionLayer(self.knowledge_store)
+        # 목적지가 없으면(단일 호스트 이벤트) 타겟을 출발지와 동일하게 취급하여 문맥 획득
+        target_for_ctx = fields["dest"] if fields["dest"] != "unknown_dest" else fields["src"]
+        ctx = self.knowledge_store.query_context(fields["user"], target_for_ctx)
         
-        # For POC, generate a dummy 50-node graph
-        mock_graph = nx.gnm_random_graph(50, 100, directed=True)
-        self.reasoning = AgenticReasoningLayer(
-            nce=NarrativeCounterfactualEngine(llm_client="MockGPT4"),
-            sse=StructuralSimulationEngine(topology_graph=mock_graph, privilege_graph=mock_graph),
-            rsem=RiskScoringEvaluationModule(alpha=0.7, beta=0.3)
+        import uuid
+        return EnrichedIncident(
+            incident_id=f"INC-{str(uuid.uuid4())[:8]}",
+            user=fields["user"],
+            user_tier=ctx["user_tier"],
+            source_host=fields["src"],
+            target_host=fields["dest"],
+            target_criticality=ctx["target_criticality"],
+            event_type=fields["event_type"],
+            flags=["suspicious_activity"] if ctx["target_criticality"] > 5 else []
         )
+
+class StructuralSimulationEngine:
+    def __init__(self, knowledge_store: InternalKnowledgeStore):
+        self.knowledge_store = knowledge_store
         
-        self.action_layer = ActionAndPlaybookLayer(ExecutionInterface())
+    def validate_feasibility(self, hypotheses: List[Hypothesis], incident: EnrichedIncident) -> List[Hypothesis]:
+        valid_hypotheses = []
+        topo = self.knowledge_store.topology
         
-    def run_pipeline(self, raw_alert: RawAlert):
-        """Sense-Reason-Act 루프 실행 (목표 처리시간: Sub-second, ~506ms)"""
-        pass
+        for hyp in hypotheses:
+            has_path = False
+            if incident.target_host != "unknown_dest" and incident.source_host != "unknown_src":
+                if topo.has_node(incident.source_host) and topo.has_node(incident.target_host):
+                    try:
+                        has_path = nx.has_path(topo, incident.source_host, incident.target_host)
+                    except nx.NodeNotFound:
+                        pass
+        
+            elif incident.source_host != "unknown_src":
+                has_path = topo.has_node(incident.source_host)
+
+            if has_path:
+                hyp.is_feasible = True
+                valid_hypotheses.append(hyp)
+                
+        return valid_hypotheses
+
+class RiskScoringEvaluationModule:
+    def __init__(self, alpha=0.7, beta=0.3):
+        self.alpha, self.beta = alpha, beta
+        
+    def rank_actions(self, feasible_hypotheses: List[Hypothesis], incident: EnrichedIncident) -> List[RankedAction]:
+        if not feasible_hypotheses: return []
+        target_to_isolate = incident.source_host if incident.source_host != "unknown_src" else incident.target_host
+        actions = [
+            ActionOption("A1", "ISOLATE_HOST", target_to_isolate, 0.92, 0.15),
+            ActionOption("A2", "MONITOR_ONLY", target_to_isolate, 0.15, 0.00)
+        ]
+        ranked = [RankedAction(act, round((self.alpha * act.containment_score) - (self.beta * act.business_impact), 3)) for act in actions]
+        ranked.sort(key=lambda x: x.composite_score, reverse=True)
+        return ranked
+
+class ActionAndPlaybookLayer:
+    def process_playbook(self, ranked_actions: List[RankedAction]) -> Dict[str, Any]:
+        if not ranked_actions: return {"status": "Ignored", "action": None}
+        top = ranked_actions[0].action
+        return {"status": "Awaiting Approval" if top.business_impact >= 0.8 else "Auto-Executed", "action": top}
+
+# ==========================================
+# Main: Execution Flow
+# ==========================================
+if __name__ == "__main__":
+    current_workspace = os.getcwd() 
+    splunk_dataset_path = os.path.join(current_workspace,"..", "Splunk_data", "datasets")
+    
+    ingester = SplunkDataIngester(base_directory=splunk_dataset_path)
+
+    logging.info("==================================================")
+    logging.info("[PASS 1] 로그 스캔을 통한 네트워크 토폴로지 및 CMDB 구축 시작...")
+    builder = LogBasedTopologyBuilder()
+    
+    log_count = 0
+    # 전체 스캔
+    for splunk_log in ingester.stream_logs(limit=None):
+        builder.ingest_single_log(splunk_log)
+        log_count += 1
+        
+    topology = builder.analyze_and_classify_nodes()
+    logging.info(f"[PASS 1 완료] 식별된 자산(노드): {topology.number_of_nodes()}개 / 엣지(경로): {topology.number_of_edges()}개")
+    
+    # ---------------------------------------------------------
+    k_store = InternalKnowledgeStore()
+    k_store.load_topology(topology)
+    
+    perception = PerceptionLayer(k_store)
+    nce = type('NarrativeCounterfactualEngine', (), {'generate_hypotheses': lambda s, i: [Hypothesis("H", "Threat", 0.7, ["T1059"])]})()
+    sse = StructuralSimulationEngine(k_store)
+    rsem = RiskScoringEvaluationModule()
+    action_layer = ActionAndPlaybookLayer()
+
+    logging.info("\n[PASS 2] 완성된 토폴로지를 기반으로 위협 탐지 파이프라인 가동 시작...")
+    
+    processed = executed_count = escalated_count = ignored_count = 0
+
+    for splunk_log in ingester.stream_logs(limit=None):
+        incident = perception.process_alert(splunk_log)
+        
+        if incident.source_host == "unknown_src" and incident.target_host == "unknown_dest":
+            ignored_count += 1
+            continue
+
+        hypotheses = nce.generate_hypotheses(incident)
+        feasible_hyps = sse.validate_feasibility(hypotheses, incident)
+        
+        if not feasible_hyps:
+            ignored_count += 1
+            continue
+            
+        ranked_actions = rsem.rank_actions(feasible_hyps, incident)
+        outcome = action_layer.process_playbook(ranked_actions)
+        
+        processed += 1
+        if "Executed" in outcome['status']: executed_count += 1
+        elif "Awaiting" in outcome['status']: escalated_count += 1
+
+    logging.info("==================================================")
+    logging.info("[최종 결과 요약]")
+    logging.info(f"총 스캔된 로그 수 : {log_count}건")
+    logging.info(f"분석된 유효 위협  : {processed}건")
+    logging.info(f"자동 조치 완료    : {executed_count}건")
+    logging.info(f"정보 누락(무시됨) : {ignored_count}건")
+    logging.info("==================================================")
